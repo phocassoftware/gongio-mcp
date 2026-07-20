@@ -145,8 +145,7 @@ export function filterByExcludeParticipantUserIds(
 ): CallDetails[] {
 	const idSet = new Set(userIds);
 	return calls.filter(
-		(call) =>
-			!call.parties?.some((p) => p.userId && idSet.has(p.userId)),
+		(call) => !call.parties?.some((p) => p.userId && idSet.has(p.userId)),
 	);
 }
 
@@ -162,9 +161,7 @@ export function filterByExcludeParticipantEmails(
 	return calls.filter(
 		(call) =>
 			!call.parties?.some(
-				(p) =>
-					p.emailAddress &&
-					emailSet.has(p.emailAddress.toLowerCase()),
+				(p) => p.emailAddress && emailSet.has(p.emailAddress.toLowerCase()),
 			),
 	);
 }
@@ -362,9 +359,90 @@ export function filterByCustomerName(
 	});
 }
 
+/**
+ * Outbound-throttling defaults. Gong throttles the whole company (a single
+ * shared API key) at 3 requests/second and 10,000/day, returning HTTP 429.
+ * A single MCP prompt ("summarise my follow-ups this week") fans out into
+ * dozens of per-call requests, so without client-side pacing those bursts trip
+ * the limit and surface as errors in the client. Overridable via env so the
+ * throttle can be tuned without a rebuild/redeploy.
+ *
+ * Note: `||` (not `??`) is deliberate. These vars are rendered into config.json
+ * by `envsubst` in the container, which substitutes an UNSET var with an empty
+ * string — and `Number('')` is 0, which would silently disable the limiter.
+ * `||` falls back to the default for '' / undefined while still honouring an
+ * explicit '0'-or-greater override (non-empty strings are truthy).
+ */
+const DEFAULT_MAX_RPS = Number(process.env.GONG_MAX_RPS || '2.5');
+const DEFAULT_MAX_RETRIES = Number(process.env.GONG_MAX_RETRIES || '5');
+const DEFAULT_BASE_BACKOFF_MS = Number(
+	process.env.GONG_BASE_BACKOFF_MS || '500',
+);
+const MAX_BACKOFF_MS = 30_000;
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Parse a Retry-After header (delta-seconds or an HTTP-date) into milliseconds.
+ * Returns undefined when the header is absent or unparseable.
+ */
+export function parseRetryAfterMs(
+	header: string | null,
+	now: () => number = Date.now,
+): number | undefined {
+	if (!header) return undefined;
+	const seconds = Number(header);
+	if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+	const dateMs = Date.parse(header);
+	if (!Number.isNaN(dateMs)) return Math.max(0, dateMs - now());
+	return undefined;
+}
+
+/**
+ * Minimum-interval scheduler (leaky bucket). Guarantees that request *starts*
+ * are spaced at least `minIntervalMs` apart, capping the outbound rate at
+ * 1000 / minIntervalMs requests per second. The reservation (read clock →
+ * compute slot → advance nextAvailable) is synchronous, so concurrent callers
+ * — e.g. a Promise.all burst — each claim a distinct, increasing slot before
+ * any await yields. Clock and sleep are injectable for deterministic tests.
+ */
+export class RateLimiter {
+	private nextAvailable = 0;
+
+	constructor(
+		private readonly minIntervalMs: number,
+		private readonly now: () => number = Date.now,
+		private readonly sleepFn: (ms: number) => Promise<void> = sleep,
+	) {}
+
+	async acquire(): Promise<void> {
+		if (this.minIntervalMs <= 0) return;
+		const current = this.now();
+		const start = Math.max(current, this.nextAvailable);
+		this.nextAvailable = start + this.minIntervalMs;
+		const wait = start - current;
+		if (wait > 0) await this.sleepFn(wait);
+	}
+}
+
 export interface GongConfig {
 	accessKey: string;
 	accessKeySecret: string;
+}
+
+export interface GongClientOptions {
+	/** Max outbound requests/second to Gong. Default: env GONG_MAX_RPS or 2.5. */
+	maxRps?: number;
+	/** Max retries on HTTP 429. Default: env GONG_MAX_RETRIES or 5. */
+	maxRetries?: number;
+	/** Base back-off in ms, doubled per attempt. Default: env or 500. */
+	baseBackoffMs?: number;
+	/** Injectable clock (testing). */
+	now?: () => number;
+	/** Injectable sleep (testing). */
+	sleep?: (ms: number) => Promise<void>;
 }
 
 // Re-export types from schemas
@@ -388,12 +466,60 @@ export type {
 
 export class GongClient {
 	private authHeader: string;
+	private limiter: RateLimiter;
+	private maxRetries: number;
+	private baseBackoffMs: number;
+	private nowFn: () => number;
+	private sleepFn: (ms: number) => Promise<void>;
 
-	constructor(config: GongConfig) {
+	constructor(config: GongConfig, options: GongClientOptions = {}) {
 		const credentials = Buffer.from(
 			`${config.accessKey}:${config.accessKeySecret}`,
 		).toString('base64');
 		this.authHeader = `Basic ${credentials}`;
+
+		const maxRps = options.maxRps ?? DEFAULT_MAX_RPS;
+		this.maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
+		this.baseBackoffMs = options.baseBackoffMs ?? DEFAULT_BASE_BACKOFF_MS;
+		this.nowFn = options.now ?? Date.now;
+		this.sleepFn = options.sleep ?? sleep;
+		const minIntervalMs =
+			Number.isFinite(maxRps) && maxRps > 0 ? 1000 / maxRps : 0;
+		this.limiter = new RateLimiter(minIntervalMs, this.nowFn, this.sleepFn);
+	}
+
+	/**
+	 * Rate-limited fetch with exponential back-off on HTTP 429. Every outbound
+	 * Gong request funnels through here: the limiter paces request starts under
+	 * the company-wide 3 req/s ceiling, and a 429 (which can still happen when
+	 * other concurrent MCP tasks share the key) is retried honouring the
+	 * Retry-After header, falling back to jittered exponential back-off. After
+	 * maxRetries the 429 response is returned unchanged so request()/get() throw
+	 * the same "Gong API error: 429 ..." as before — preserving the contract.
+	 */
+	private async fetchWithRetry(
+		url: string,
+		init: RequestInit,
+	): Promise<Response> {
+		for (let attempt = 0; ; attempt++) {
+			await this.limiter.acquire();
+			const response = await fetch(url, init);
+			if (response.status !== 429 || attempt >= this.maxRetries) {
+				return response;
+			}
+			// Drain the body so the socket can be reused, then back off.
+			await response.text().catch(() => undefined);
+			const retryAfterMs = parseRetryAfterMs(
+				response.headers?.get?.('retry-after') ?? null,
+				this.nowFn,
+			);
+			const backoff = Math.min(
+				MAX_BACKOFF_MS,
+				this.baseBackoffMs * 2 ** attempt,
+			);
+			const jitter = backoff * 0.25 * Math.random();
+			await this.sleepFn(retryAfterMs ?? backoff + jitter);
+		}
 	}
 
 	private async request<T>(
@@ -402,7 +528,7 @@ export class GongClient {
 		body?: unknown,
 	): Promise<T> {
 		const url = `${GONG_API_BASE}${endpoint}`;
-		const response = await fetch(url, {
+		const response = await this.fetchWithRetry(url, {
 			method,
 			headers: {
 				Authorization: this.authHeader,
@@ -434,7 +560,7 @@ export class GongClient {
 			}
 		}
 
-		const response = await fetch(url.toString(), {
+		const response = await this.fetchWithRetry(url.toString(), {
 			method: 'GET',
 			headers: {
 				Authorization: this.authHeader,
@@ -566,11 +692,7 @@ export class GongClient {
 		}
 
 		try {
-			const response = await this.request(
-				'POST',
-				'/calls/extensive',
-				body,
-			);
+			const response = await this.request('POST', '/calls/extensive', body);
 			return parseCallDetailsResponse(response);
 		} catch (err) {
 			// Gong's calls/extensive returns 404 with "No calls found corresponding
@@ -664,10 +786,7 @@ export class GongClient {
 		// Apply client-side filters
 		let filtered = allCalls;
 		if (options.primaryUserEmails && options.primaryUserEmails.length > 0) {
-			filtered = filterByPrimaryUserEmails(
-				filtered,
-				options.primaryUserEmails,
-			);
+			filtered = filterByPrimaryUserEmails(filtered, options.primaryUserEmails);
 		}
 		if (
 			options.excludePrimaryUserIds &&
@@ -694,10 +813,7 @@ export class GongClient {
 			);
 		}
 		if (options.participantEmails && options.participantEmails.length > 0) {
-			filtered = filterByParticipantEmails(
-				filtered,
-				options.participantEmails,
-			);
+			filtered = filterByParticipantEmails(filtered, options.participantEmails);
 		}
 		if (
 			options.excludeParticipantEmails &&
@@ -946,9 +1062,7 @@ export class GongClient {
 	 * Search calls by account/company via email-domain match on parties.
 	 * Optionally also matches on CRM Account context object names.
 	 */
-	async searchCallsByAccount(
-		options: SearchCallsByAccountRequest,
-	): Promise<{
+	async searchCallsByAccount(options: SearchCallsByAccountRequest): Promise<{
 		calls: CallDetailsResponse['calls'];
 		totalScanned: number;
 		matched: number;
@@ -1051,10 +1165,7 @@ export class GongClient {
 							typeof nameField?.value === 'string'
 								? nameField.value.toLowerCase()
 								: undefined;
-						if (
-							name &&
-							lowerNames.some((needle) => name.includes(needle))
-						) {
+						if (name && lowerNames.some((needle) => name.includes(needle))) {
 							return true;
 						}
 					}
