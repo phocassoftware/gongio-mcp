@@ -716,8 +716,10 @@ describe('formatCallTranscript', () => {
 
 		const result = formatCallTranscript(transcript, parties);
 		expect(result).toContain('## Transcript (Call 123)');
-		expect(result).toContain('[John Host]: Hello, welcome to the call.');
-		expect(result).toContain('[Jane Guest]: Thanks for having me.');
+		expect(result).toContain(
+			'[00:00] [John Host]: Hello, welcome to the call.',
+		);
+		expect(result).toContain('[00:05] [Jane Guest]: Thanks for having me.');
 	});
 
 	it('uses speaker ID when no party info available', () => {
@@ -732,7 +734,26 @@ describe('formatCallTranscript', () => {
 		};
 
 		const result = formatCallTranscript(transcript, null);
-		expect(result).toContain('[Speaker unknown-speaker]: Some text here.');
+		expect(result).toContain(
+			'[00:00] [Speaker unknown-speaker]: Some text here.',
+		);
+	});
+
+	it('formats hour-length timestamps as HH:MM:SS', () => {
+		const transcript: CallTranscript = {
+			callId: 'hour-call',
+			transcript: [
+				{
+					speakerId: 'speaker-1',
+					sentences: [
+						{ start: 3_661_000, end: 3_666_000, text: 'Past one hour.' },
+					],
+				},
+			],
+		};
+
+		const result = formatCallTranscript(transcript, null);
+		expect(result).toContain('[01:01:01] [Speaker speaker-1]: Past one hour.');
 	});
 
 	it('handles empty transcript', () => {
@@ -762,9 +783,9 @@ describe('formatCallTranscript', () => {
 		};
 
 		const result = formatCallTranscript(transcript, null);
-		expect(result).toContain(
-			'First sentence. Second sentence. Third sentence.',
-		);
+		expect(result).toContain('[00:00] [Speaker speaker-1]: First sentence.');
+		expect(result).toContain('[00:02] [Speaker speaker-1]: Second sentence.');
+		expect(result).toContain('[00:04] [Speaker speaker-1]: Third sentence.');
 	});
 
 	it('truncates long transcripts with maxLength', () => {

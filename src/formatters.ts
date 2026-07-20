@@ -444,10 +444,11 @@ export function formatCallTranscript(
 	for (const entry of transcript.transcript) {
 		const speakerName =
 			speakerNames.get(entry.speakerId) ?? `Speaker ${entry.speakerId}`;
-		const text = entry.sentences.map((s) => s.text).join(' ');
-		fullLines.push(
-			`[${escapeMarkdown(speakerName)}]: ${escapeMarkdown(text)}\n`,
-		);
+		for (const sentence of entry.sentences) {
+			fullLines.push(
+				`[${escapeMarkdown(formatTimeMs(sentence.start))}] [${escapeMarkdown(speakerName)}]: ${escapeMarkdown(sentence.text)}\n`,
+			);
+		}
 	}
 	const fullText = fullLines.join('\n');
 	const totalLength = fullText.length;
@@ -528,6 +529,27 @@ export function formatUsersResponse(response: UsersResponse): string {
  */
 function escapeMarkdown(text: string): string {
 	return text.replace(/\|/g, '\\|').replace(/\n/g, ' ').replace(/\r/g, '');
+}
+
+/**
+ * Format milliseconds as MM:SS or HH:MM:SS for transcript timestamps.
+ */
+function formatTimeMs(milliseconds: number): string {
+	const clampedMilliseconds = Math.max(0, milliseconds);
+	const totalSeconds = Math.floor(clampedMilliseconds / 1000);
+	const hours = Math.floor(totalSeconds / 3600);
+	const minutes = Math.floor((totalSeconds % 3600) / 60);
+	const seconds = totalSeconds % 60;
+
+	if (hours > 0) {
+		return [hours, minutes, seconds]
+			.map((value) => String(value).padStart(2, '0'))
+			.join(':');
+	}
+
+	return [minutes, seconds]
+		.map((value) => String(value).padStart(2, '0'))
+		.join(':');
 }
 
 /**
