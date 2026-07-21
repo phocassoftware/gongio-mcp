@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { GongClient, parseRetryAfterMs, RateLimiter } from '../src/gong.js';
+import {
+	envNumber,
+	GongClient,
+	parseRetryAfterMs,
+	RateLimiter,
+} from '../src/gong.js';
 import type { CallDetailsResponse } from '../src/schemas.js';
 
 /**
@@ -30,6 +35,25 @@ const EMPTY_CALLS: CallDetailsResponse = {
 	records: { totalRecords: 0, currentPageSize: 0, currentPageNumber: 1 },
 	calls: [],
 };
+
+describe('envNumber', () => {
+	it('falls back when unset or empty (envsubst renders unset as "")', () => {
+		expect(envNumber(undefined, 5, 0, 20)).toBe(5);
+		expect(envNumber('', 5, 0, 20)).toBe(5);
+	});
+	it('falls back on non-numeric values instead of returning NaN', () => {
+		// The bug this guards: Number("off") === NaN would make
+		// `attempt >= maxRetries` always false -> unbounded 429 retry loop.
+		expect(envNumber('off', 5, 0, 20)).toBe(5);
+		expect(Number.isNaN(envNumber('off', 5, 0, 20))).toBe(false);
+	});
+	it('parses and clamps to [min, max]', () => {
+		expect(envNumber('3', 5, 0, 20)).toBe(3);
+		expect(envNumber('999', 5, 0, 20)).toBe(20); // clamp high
+		expect(envNumber('-1', 5, 0, 20)).toBe(0); // clamp low
+		expect(envNumber('0', 5, 0, 20)).toBe(0); // explicit 0 honoured
+	});
+});
 
 describe('parseRetryAfterMs', () => {
 	it('parses delta-seconds', () => {

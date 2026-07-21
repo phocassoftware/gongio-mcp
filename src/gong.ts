@@ -366,19 +366,40 @@ export function filterByCustomerName(
  * dozens of per-call requests, so without client-side pacing those bursts trip
  * the limit and surface as errors in the client. Overridable via env so the
  * throttle can be tuned without a rebuild/redeploy.
- *
- * Note: `||` (not `??`) is deliberate. These vars are rendered into config.json
- * by `envsubst` in the container, which substitutes an UNSET var with an empty
- * string — and `Number('')` is 0, which would silently disable the limiter.
- * `||` falls back to the default for '' / undefined while still honouring an
- * explicit '0'-or-greater override (non-empty strings are truthy).
  */
-const DEFAULT_MAX_RPS = Number(process.env.GONG_MAX_RPS || '2.5');
-const DEFAULT_MAX_RETRIES = Number(process.env.GONG_MAX_RETRIES || '5');
-const DEFAULT_BASE_BACKOFF_MS = Number(
-	process.env.GONG_BASE_BACKOFF_MS || '500',
-);
 const MAX_BACKOFF_MS = 30_000;
+
+/**
+ * Parse a numeric env var, clamped to [min, max]. Falls back to `fallback`
+ * when the var is unset, empty (an unset var is rendered as "" by the
+ * container's `envsubst`), or non-numeric.
+ *
+ * The non-numeric guard matters: a mis-set value like GONG_MAX_RETRIES=off
+ * would otherwise become `Number('off') === NaN`, and since `attempt >= NaN`
+ * is always false, fetchWithRetry would retry 429s forever (with NaN back-off
+ * collapsing to 0ms — a tight loop hammering Gong). Clamping also bounds the
+ * loop regardless of what an operator sets.
+ */
+export function envNumber(
+	raw: string | undefined,
+	fallback: number,
+	min: number,
+	max: number,
+): number {
+	if (raw === undefined || raw === '') return fallback;
+	const parsed = Number(raw);
+	const value = Number.isFinite(parsed) ? parsed : fallback;
+	return Math.min(max, Math.max(min, value));
+}
+
+const DEFAULT_MAX_RPS = envNumber(process.env.GONG_MAX_RPS, 2.5, 0, 100);
+const DEFAULT_MAX_RETRIES = envNumber(process.env.GONG_MAX_RETRIES, 5, 0, 20);
+const DEFAULT_BASE_BACKOFF_MS = envNumber(
+	process.env.GONG_BASE_BACKOFF_MS,
+	500,
+	0,
+	MAX_BACKOFF_MS,
+);
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
