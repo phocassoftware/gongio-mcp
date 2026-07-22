@@ -400,9 +400,40 @@ const DEFAULT_BASE_BACKOFF_MS = envNumber(
 	0,
 	MAX_BACKOFF_MS,
 );
+// Total wall-clock budget for 429 retries before failing fast. Kept short so a
+// throttled request surfaces a clear error quickly instead of hanging into a
+// client timeout / proxy 502. Default 20s.
+const DEFAULT_MAX_RETRY_MS = envNumber(
+	process.env.GONG_MAX_RETRY_MS,
+	20_000,
+	0,
+	120_000,
+);
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Thrown when Gong keeps returning HTTP 429 and the client's retry budget is
+ * exhausted. The message is written for business users (Customer Success):
+ * a plain "temporarily rate-limited, try again / narrow the request" — no
+ * mention of the underlying quota mechanics. Surfaced through the MCP tool
+ * instead of a raw 429 body or a silent timeout.
+ */
+export class GongRateLimitError extends Error {
+	constructor(retryAfterMs?: number) {
+		const wait = retryAfterMs
+			? `about ${Math.max(1, Math.round(retryAfterMs / 1000))} seconds`
+			: 'a minute';
+		super(
+			`Gong is temporarily rate-limiting requests, so this one couldn't be ` +
+				`completed. Please wait ${wait} and try again — or narrow your ` +
+				`request (e.g. a single call or a specific date range) so it ` +
+				`retrieves less data. If the issue continues, please contact IT.`,
+		);
+		this.name = 'GongRateLimitError';
+	}
 }
 
 /**
@@ -458,6 +489,8 @@ export interface GongClientOptions {
 	maxRps?: number;
 	/** Max retries on HTTP 429. Default: env GONG_MAX_RETRIES or 5. */
 	maxRetries?: number;
+	/** Total wall-clock budget (ms) for 429 retries before failing fast. Default: env GONG_MAX_RETRY_MS or 20000. */
+	maxRetryMs?: number;
 	/** Base back-off in ms, doubled per attempt. Default: env or 500. */
 	baseBackoffMs?: number;
 	/** Injectable clock (testing). */
@@ -489,6 +522,7 @@ export class GongClient {
 	private authHeader: string;
 	private limiter: RateLimiter;
 	private maxRetries: number;
+	private maxRetryMs: number;
 	private baseBackoffMs: number;
 	private nowFn: () => number;
 	private sleepFn: (ms: number) => Promise<void>;
@@ -501,6 +535,7 @@ export class GongClient {
 
 		const maxRps = options.maxRps ?? DEFAULT_MAX_RPS;
 		this.maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
+		this.maxRetryMs = options.maxRetryMs ?? DEFAULT_MAX_RETRY_MS;
 		this.baseBackoffMs = options.baseBackoffMs ?? DEFAULT_BASE_BACKOFF_MS;
 		this.nowFn = options.now ?? Date.now;
 		this.sleepFn = options.sleep ?? sleep;
@@ -510,25 +545,30 @@ export class GongClient {
 	}
 
 	/**
-	 * Rate-limited fetch with exponential back-off on HTTP 429. Every outbound
-	 * Gong request funnels through here: the limiter paces request starts under
-	 * the company-wide 3 req/s ceiling, and a 429 (which can still happen when
-	 * other concurrent MCP tasks share the key) is retried honouring the
-	 * Retry-After header, falling back to jittered exponential back-off. After
-	 * maxRetries the 429 response is returned unchanged so request()/get() throw
-	 * the same "Gong API error: 429 ..." as before — preserving the contract.
+	 * Rate-limited fetch with bounded 429 back-off. Every outbound Gong request
+	 * funnels through here: the limiter paces request starts under the
+	 * company-wide 3 req/s ceiling, and a 429 is retried honouring the
+	 * Retry-After header (falling back to jittered exponential back-off).
+	 *
+	 * Retries are bounded by BOTH maxRetries and a wall-clock budget
+	 * (maxRetryMs, default 20s). We fail fast — throwing GongRateLimitError with
+	 * an actionable message — once retries are spent OR the next wait would
+	 * exceed the remaining budget (e.g. a large Retry-After). This avoids the
+	 * request hanging into a client timeout / proxy 502 under sustained
+	 * throttling, and surfaces a clear reason instead of a raw 429 body.
 	 */
 	private async fetchWithRetry(
 		url: string,
 		init: RequestInit,
 	): Promise<Response> {
+		const startedAt = this.nowFn();
 		for (let attempt = 0; ; attempt++) {
 			await this.limiter.acquire();
 			const response = await fetch(url, init);
-			if (response.status !== 429 || attempt >= this.maxRetries) {
+			if (response.status !== 429) {
 				return response;
 			}
-			// Drain the body so the socket can be reused, then back off.
+			// Drain the body so the socket can be reused, then decide on back-off.
 			await response.text().catch(() => undefined);
 			const retryAfterMs = parseRetryAfterMs(
 				response.headers?.get?.('retry-after') ?? null,
@@ -539,7 +579,13 @@ export class GongClient {
 				this.baseBackoffMs * 2 ** attempt,
 			);
 			const jitter = backoff * 0.25 * Math.random();
-			await this.sleepFn(retryAfterMs ?? backoff + jitter);
+			const waitMs = retryAfterMs ?? backoff + jitter;
+
+			const remainingMs = this.maxRetryMs - (this.nowFn() - startedAt);
+			if (attempt >= this.maxRetries || waitMs >= remainingMs) {
+				throw new GongRateLimitError(retryAfterMs);
+			}
+			await this.sleepFn(waitMs);
 		}
 	}
 
