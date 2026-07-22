@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
 	envNumber,
 	GongClient,
+	GongRateLimitError,
 	parseRetryAfterMs,
 	RateLimiter,
 } from '../src/gong.js';
@@ -146,15 +147,69 @@ describe('GongClient 429 handling', () => {
 		expect(sleeps).toEqual([2000]); // exact, no jitter when Retry-After present
 	});
 
-	it('throws the original Gong error after exhausting retries', async () => {
+	it('throws a clear GongRateLimitError once retries are exhausted', async () => {
 		fetchMock.mockResolvedValue(
 			mockResponse({ status: 429, body: { errors: ['rate limit'] } }),
 		);
 
-		await expect(makeClient(1).searchCalls({})).rejects.toThrow(
-			/Gong API error: 429/,
-		);
+		const err = await makeClient(1)
+			.searchCalls({})
+			.catch((e) => e);
+		expect(err).toBeInstanceOf(GongRateLimitError);
+		// Plain, business-user reason — no quota mechanics, not the raw 429 body.
+		expect(err.message).toMatch(/temporarily rate-limiting/i);
+		expect(err.message).toMatch(/try again/i);
+		expect(err.message).toMatch(/contact IT/);
+		expect(err.message).not.toMatch(/company-wide|429|10,000/);
 		// attempt 0 + 1 retry = 2 calls.
 		expect(fetchMock).toHaveBeenCalledTimes(2);
+	});
+
+	it('fails fast (no sleep) when Retry-After exceeds the budget', async () => {
+		fetchMock.mockResolvedValue(
+			mockResponse({ status: 429, retryAfter: '60' }),
+		);
+		const client = new GongClient(
+			{ accessKey: 'k', accessKeySecret: 's' },
+			{
+				maxRps: 0,
+				maxRetries: 5,
+				maxRetryMs: 20_000, // 20s budget; Gong asked for 60s -> give up now
+				now: () => 0,
+				sleep: async (ms) => {
+					sleeps.push(ms);
+				},
+			},
+		);
+
+		const err = await client.searchCalls({}).catch((e) => e);
+		expect(err).toBeInstanceOf(GongRateLimitError);
+		expect(err.message).toMatch(/wait about 60 seconds/); // Retry-After surfaced plainly
+		expect(fetchMock).toHaveBeenCalledTimes(1); // did not retry
+		expect(sleeps).toEqual([]); // never slept into the 60s
+	});
+
+	it('stops retrying once the wall-clock budget is spent (not just maxRetries)', async () => {
+		fetchMock.mockResolvedValue(mockResponse({ status: 429 }));
+		let clock = 0;
+		const client = new GongClient(
+			{ accessKey: 'k', accessKeySecret: 's' },
+			{
+				maxRps: 0,
+				maxRetries: 100, // high, so the BUDGET is what stops it
+				maxRetryMs: 20_000,
+				baseBackoffMs: 1000,
+				now: () => clock,
+				sleep: async (ms) => {
+					clock += ms; // time advances as we back off
+				},
+			},
+		);
+
+		const err = await client.searchCalls({}).catch((e) => e);
+		expect(err).toBeInstanceOf(GongRateLimitError);
+		expect(clock).toBeLessThan(20_000); // never sleeps past the budget
+		expect(fetchMock.mock.calls.length).toBeGreaterThan(2); // did retry a few times
+		expect(err.message).toMatch(/temporarily rate-limiting/i);
 	});
 });
