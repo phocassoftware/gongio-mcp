@@ -477,11 +477,15 @@ export class GongRateLimitError extends Error {
 	constructor(retryAfterMs?: number) {
 		super(
 			retryAfterMs !== undefined && retryAfterMs >= LONG_WAIT_MS
-				? `Gong is temporarily rate-limiting requests, so this one couldn't ` +
+				? // No "contact IT" here: the allowance is Gong's and shared, so
+					// there is nothing anyone internal can do to return the data
+					// sooner. Offering an escalation that cannot help just moves the
+					// frustration onto a support queue.
+					`Gong is temporarily rate-limiting requests, so this one couldn't ` +
 						`be completed. The limit is shared across everyone here and ` +
 						`clears in ${formatRetryWait(retryAfterMs)} — until then, ` +
 						`retrying or narrowing this request won't get through. Please ` +
-						`try again after that, and contact IT if you need the data sooner.`
+						`try again after that.`
 				: `Gong is temporarily rate-limiting requests, so this one couldn't ` +
 						`be completed. Please wait ` +
 						`${retryAfterMs === undefined ? 'a minute' : formatRetryWait(retryAfterMs)} ` +

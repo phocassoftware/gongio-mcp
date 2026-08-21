@@ -114,7 +114,10 @@ describe('GongRateLimitError message', () => {
 		expect(err.message).toMatch(
 			/retrying or narrowing this request won't get through/,
 		);
-		expect(err.message).toMatch(/contact IT/);
+		// Deliberately no escalation: the allowance is Gong's and shared, so IT
+		// cannot return the data sooner. Suggesting otherwise just routes the
+		// frustration to a support queue that can only repeat "wait".
+		expect(err.message).not.toMatch(/contact IT/);
 		// Still no mechanics, and no raw seconds count.
 		expect(err.message).not.toMatch(/company-wide|429|10,?000|seconds/);
 	});

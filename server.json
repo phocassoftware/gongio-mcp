@@ -6,12 +6,12 @@
 		"url": "https://github.com/JustinBeckwith/gongio-mcp",
 		"source": "github"
 	},
-	"version": "1.5.0-phocas.4",
+	"version": "1.5.0-phocas.5",
 	"packages": [
 		{
 			"registryType": "npm",
 			"identifier": "gongio-mcp",
-			"version": "1.5.0-phocas.4",
+			"version": "1.5.0-phocas.5",
 			"transport": {
 				"type": "stdio"
 			}
