@@ -90,8 +90,6 @@ export function buildContentSelector(
 	return selector;
 }
 
-export const MAX_SEARCH_PAGES = 50;
-
 /**
  * Detect Gong's "no results" 404 so callers can return an empty response
  * instead of surfacing it as an error.
@@ -410,6 +408,25 @@ const DEFAULT_MAX_RETRY_MS = envNumber(
 	120_000,
 );
 
+/**
+ * Hard ceiling on the number of paginated Gong requests one search_calls tool
+ * call may spend. This is a *quota* control, not a loop guard: the daily cap is
+ * 10,000 requests for the whole company, so a single unfiltered search that
+ * walks 50 pages burns 0.5% of the day per call. On 2026-08-20 search_calls hit
+ * the old 50-page ceiling 144 times in one day — ~7,200 requests, most of the
+ * daily allowance, from one tool.
+ *
+ * A search that runs out of pages returns partial results and says so, both on
+ * stderr and in the tool output, so the caller can narrow the date range
+ * instead of silently reasoning over a truncated set.
+ */
+export const MAX_SEARCH_PAGES = envNumber(
+	process.env.GONG_MAX_SEARCH_PAGES,
+	10,
+	1,
+	50,
+);
+
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -450,6 +467,19 @@ export function parseRetryAfterMs(
 	const dateMs = Date.parse(header);
 	if (!Number.isNaN(dateMs)) return Math.max(0, dateMs - now());
 	return undefined;
+}
+
+/**
+ * Path of a request URL, for log lines. Query strings are dropped: they carry
+ * opaque pagination cursors that add length without telling an operator
+ * anything. Falls back to the raw string if the URL will not parse.
+ */
+export function requestPath(url: string): string {
+	try {
+		return new URL(url).pathname;
+	} catch {
+		return url;
+	}
 }
 
 /**
@@ -556,6 +586,12 @@ export class GongClient {
 	 * exceed the remaining budget (e.g. a large Retry-After). This avoids the
 	 * request hanging into a client timeout / proxy 502 under sustained
 	 * throttling, and surfaces a clear reason instead of a raw 429 body.
+	 *
+	 * Every 429 is logged to stderr. Without that the throttling is invisible:
+	 * retries succeed silently, and a GongRateLimitError travels back to the
+	 * caller as an MCP tool error that the container never sees (the middleware
+	 * logs the HTTP 200 that carries it). Under the container's stderr relay
+	 * these lines land in CloudWatch as `process.name: gongio-mcp`.
 	 */
 	private async fetchWithRetry(
 		url: string,
@@ -581,10 +617,27 @@ export class GongClient {
 			const jitter = backoff * 0.25 * Math.random();
 			const waitMs = retryAfterMs ?? backoff + jitter;
 
-			const remainingMs = this.maxRetryMs - (this.nowFn() - startedAt);
+			// One clock read per iteration: the budget decision and the log line
+			// must agree, and an injected clock that advances per call would
+			// otherwise spend budget on the logging.
+			const elapsedMs = this.nowFn() - startedAt;
+			const remainingMs = this.maxRetryMs - elapsedMs;
+			const path = requestPath(url);
 			if (attempt >= this.maxRetries || waitMs >= remainingMs) {
+				const reason =
+					attempt >= this.maxRetries ? 'retries-exhausted' : 'budget-exhausted';
+				console.error(
+					`gong 429 gave up: path=${path} attempts=${attempt + 1} ` +
+						`elapsedMs=${Math.round(elapsedMs)} nextWaitMs=${Math.round(waitMs)} ` +
+						`retryAfterMs=${retryAfterMs ?? '-'} reason=${reason}`,
+				);
 				throw new GongRateLimitError(retryAfterMs);
 			}
+			console.error(
+				`gong 429 retrying: path=${path} attempt=${attempt + 1} ` +
+					`waitMs=${Math.round(waitMs)} retryAfterMs=${retryAfterMs ?? '-'} ` +
+					`elapsedMs=${Math.round(elapsedMs)}`,
+			);
 			await this.sleepFn(waitMs);
 		}
 	}
@@ -806,7 +859,12 @@ export class GongClient {
 		language?: string;
 		minDuration?: number;
 		maxDuration?: number;
-	}): Promise<{ response: CallDetailsResponse; totalBeforeFilter: number }> {
+	}): Promise<{
+		response: CallDetailsResponse;
+		totalBeforeFilter: number;
+		/** True when the page limit stopped the walk with results still unread. */
+		truncated: boolean;
+	}> {
 		const allCalls: CallDetails[] = [];
 		let cursor: string | undefined;
 		let pageCount = 0;
@@ -842,9 +900,12 @@ export class GongClient {
 			pageCount++;
 		} while (cursor && pageCount < MAX_SEARCH_PAGES);
 
-		if (pageCount >= MAX_SEARCH_PAGES && cursor) {
+		const truncated = pageCount >= MAX_SEARCH_PAGES && Boolean(cursor);
+		if (truncated) {
 			console.error(
-				`search_calls: reached max page limit (${MAX_SEARCH_PAGES}), returning partial results`,
+				`search_calls: page limit reached: pages=${pageCount} ` +
+					`calls=${allCalls.length} requests=${pageCount} — returning partial ` +
+					`results (raise GONG_MAX_SEARCH_PAGES or narrow the search)`,
 			);
 		}
 
@@ -930,6 +991,7 @@ export class GongClient {
 				calls: filtered,
 			},
 			totalBeforeFilter,
+			truncated,
 		};
 	}
 

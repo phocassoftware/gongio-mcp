@@ -133,6 +133,37 @@ describe('formatCallDetailsResponse', () => {
 		expect(result).toContain('No calls found.');
 	});
 
+	it('warns in the output when results were truncated by the page limit', () => {
+		const response: CallDetailsResponse = {
+			requestId: 'test-123',
+			records: { totalRecords: 1, currentPageSize: 1, currentPageNumber: 1 },
+			calls: [{ metaData: { id: '123', title: 'Sales Call' } }],
+		};
+
+		const truncated = formatCallDetailsResponse(
+			response,
+			undefined,
+			undefined,
+			true,
+		);
+		expect(truncated).toContain('Partial results');
+		// Points only at arguments Gong itself filters on — the ones that actually
+		// shorten the walk — and warns off the post-pagination filters.
+		expect(truncated).toContain('fromDateTime/toDateTime');
+		expect(truncated).toContain('primaryUserIds');
+		expect(truncated).toMatch(/customerName, scope and trackers are applied/);
+
+		// End users see the consequence, never the mechanics: no server-side knob
+		// name, no page/quota counts. Those go to the container log only.
+		expect(truncated).not.toContain('GONG_MAX_SEARCH_PAGES');
+		expect(truncated).not.toMatch(/page limit|pages=|requests=|10,?000/);
+
+		// Absent by default: a complete result must not carry the caveat.
+		expect(formatCallDetailsResponse(response)).not.toContain(
+			'Partial results',
+		);
+	});
+
 	it('formats calls as markdown table from CallDetailsResponse', () => {
 		const response: CallDetailsResponse = {
 			requestId: 'test-123',

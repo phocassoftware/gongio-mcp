@@ -17,6 +17,7 @@ import {
 	filterBySystem,
 	filterByTitleContains,
 	filterByTrackers,
+	MAX_SEARCH_PAGES,
 } from '../src/gong.js';
 import type {
 	CallDetails,
@@ -796,6 +797,72 @@ describe('GongClient', () => {
 				fetchMock.mock.calls[1][1].body,
 			);
 			expect(secondCallBody.cursor).toBe('page-2');
+		});
+
+		it('stops at MAX_SEARCH_PAGES, flags truncated, and logs the stop', async () => {
+			// Every page hands back another cursor, so only the page cap can end
+			// the walk. maxRps: 0 keeps the pacing sleeps out of the test.
+			const paced = new GongClient(
+				{ accessKey: 'test-key', accessKeySecret: 'test-secret' },
+				{ maxRps: 0 },
+			);
+			const page = (n: number): CallDetailsResponse => ({
+				requestId: `req-${n}`,
+				records: {
+					totalRecords: 999,
+					currentPageSize: 1,
+					currentPageNumber: n,
+					cursor: `page-${n + 1}`,
+				},
+				calls: [{ metaData: { id: String(n), title: `Call ${n}` } }],
+			});
+			fetchMock.mockImplementation(async () => ({
+				ok: true,
+				json: async () => page(fetchMock.mock.calls.length),
+			}));
+			const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+			const { response, truncated } = await paced.searchCallsAll({});
+
+			expect(fetchMock).toHaveBeenCalledTimes(MAX_SEARCH_PAGES);
+			expect(response.calls).toHaveLength(MAX_SEARCH_PAGES);
+			expect(truncated).toBe(true);
+			expect(stderr).toHaveBeenCalledTimes(1);
+			expect(stderr.mock.calls[0][0]).toMatch(
+				new RegExp(`page limit reached: pages=${MAX_SEARCH_PAGES}`),
+			);
+		});
+
+		it('defaults the page cap well below the old 50 (daily quota)', () => {
+			// Gong allows 10,000 requests/day company-wide. One search that walks
+			// 50 pages spends 0.5% of that; 144 of them in a day (2026-08-20) spent
+			// most of it. Guards against the default drifting back up.
+			//
+			// The constant is read from GONG_MAX_SEARCH_PAGES at import time, so an
+			// operator override in the runner's environment is legitimate — assert
+			// the clamp then, not the default.
+			const override = process.env.GONG_MAX_SEARCH_PAGES;
+			if (override === undefined || override === '') {
+				expect(MAX_SEARCH_PAGES).toBe(10);
+			} else {
+				expect(MAX_SEARCH_PAGES).toBeGreaterThanOrEqual(1);
+				expect(MAX_SEARCH_PAGES).toBeLessThanOrEqual(50);
+			}
+		});
+
+		it('does not flag truncated when the last page has no cursor', async () => {
+			const onlyPage: CallDetailsResponse = {
+				requestId: 'req-1',
+				records: { totalRecords: 1, currentPageSize: 1, currentPageNumber: 0 },
+				calls: [{ metaData: { id: '1', title: 'Call 1' } }],
+			};
+			fetchMock.mockResolvedValueOnce({ ok: true, json: async () => onlyPage });
+			const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+			const { truncated } = await client.searchCallsAll({});
+
+			expect(truncated).toBe(false);
+			expect(stderr).not.toHaveBeenCalled();
 		});
 
 		it('returns empty results for no calls', async () => {
