@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
 	envNumber,
+	formatRetryWait,
 	GongClient,
 	GongRateLimitError,
 	parseRetryAfterMs,
@@ -70,6 +71,56 @@ describe('parseRetryAfterMs', () => {
 	it('returns undefined for missing/garbage headers', () => {
 		expect(parseRetryAfterMs(null)).toBeUndefined();
 		expect(parseRetryAfterMs('not-a-date')).toBeUndefined();
+	});
+});
+
+describe('formatRetryWait', () => {
+	it('keeps seconds for short waits', () => {
+		expect(formatRetryWait(2000)).toBe('about 2 seconds');
+		expect(formatRetryWait(59_000)).toBe('about 59 seconds');
+		expect(formatRetryWait(1)).toBe('about a second'); // floor, never "0 seconds"
+	});
+	it('switches to minutes, singular at one', () => {
+		expect(formatRetryWait(60_000)).toBe('about a minute');
+		expect(formatRetryWait(15 * 60_000)).toBe('about 15 minutes');
+	});
+	it('switches to hours and drops sub-5-minute noise', () => {
+		expect(formatRetryWait(3600_000)).toBe('about an hour');
+		expect(formatRetryWait(3720_000)).toBe('about an hour'); // 62m -> 2m rest, dropped
+		expect(formatRetryWait(2 * 3600_000)).toBe('about 2 hours');
+	});
+	it('renders the wait seen in production (4808s) in words', () => {
+		// The message that prompted this: "wait about 4808 seconds".
+		expect(formatRetryWait(4_808_000)).toBe('about an hour and 20 minutes');
+	});
+});
+
+describe('GongRateLimitError message', () => {
+	it('tells the caller to narrow the request when the wait is short', () => {
+		const err = new GongRateLimitError(30_000);
+		expect(err.message).toContain('about 30 seconds');
+		expect(err.message).toMatch(/narrow your request/);
+		expect(err.message).toMatch(/contact IT/);
+	});
+
+	it('says narrowing will not help once the allowance is spent', () => {
+		// A long Retry-After is the daily allowance, not burst pacing: retrying
+		// variations just spends more requests. Advice has to flip.
+		const err = new GongRateLimitError(4_808_000);
+		expect(err.message).toContain('about an hour and 20 minutes');
+		expect(err.message).toMatch(/shared across everyone here/);
+		expect(err.message).toMatch(
+			/retrying or narrowing this request won't get through/,
+		);
+		expect(err.message).toMatch(/contact IT/);
+		// Still no mechanics, and no raw seconds count.
+		expect(err.message).not.toMatch(/company-wide|429|10,?000|seconds/);
+	});
+
+	it('falls back to a vague wait when Gong sends no Retry-After', () => {
+		const err = new GongRateLimitError();
+		expect(err.message).toMatch(/wait a minute and try again/);
+		expect(err.message).toMatch(/narrow your request/);
 	});
 });
 
@@ -196,7 +247,7 @@ describe('GongClient 429 handling', () => {
 
 		const err = await client.searchCalls({}).catch((e) => e);
 		expect(err).toBeInstanceOf(GongRateLimitError);
-		expect(err.message).toMatch(/wait about 60 seconds/); // Retry-After surfaced plainly
+		expect(err.message).toMatch(/wait about a minute/); // Retry-After, in words
 		expect(fetchMock).toHaveBeenCalledTimes(1); // did not retry
 		expect(sleeps).toEqual([]); // never slept into the 60s
 	});
