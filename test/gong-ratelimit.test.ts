@@ -78,7 +78,9 @@ describe('formatRetryWait', () => {
 	it('keeps seconds for short waits', () => {
 		expect(formatRetryWait(2000)).toBe('about 2 seconds');
 		expect(formatRetryWait(59_000)).toBe('about 59 seconds');
-		expect(formatRetryWait(1)).toBe('about a second'); // floor, never "0 seconds"
+		// Math.round would give 0 here; the clamp to a 1s minimum keeps the
+		// message from reading "about 0 seconds".
+		expect(formatRetryWait(1)).toBe('about a second');
 	});
 	it('switches to minutes, singular at one', () => {
 		expect(formatRetryWait(60_000)).toBe('about a minute');
