@@ -103,6 +103,21 @@ function extractAccountName(call: CallDetails): string | null {
 export const MAX_OUTPUT_LENGTH =
 	Number.parseInt(process.env.MAX_MCP_OUTPUT_LENGTH ?? '', 10) || 50000;
 
+/**
+ * Prepended to a search whose pagination hit MAX_SEARCH_PAGES. Says only what
+ * the caller can act on: the list is incomplete, and which tool arguments
+ * narrow it. No mechanics — no page counts, no quota, and never the name of a
+ * server-side knob like GONG_MAX_SEARCH_PAGES. Those belong in the container
+ * log (see searchCallsAll), which operators read and end users do not; the same
+ * split GongRateLimitError keeps. fromDateTime/toDateTime and the filter names
+ * stay because they are this tool's own arguments, not internal config.
+ */
+const TRUNCATED_WARNING =
+	'> ⚠️ Partial results — this search reached its limit before returning every ' +
+	'matching call, so some calls are missing. Do not present it as a complete ' +
+	'list: narrow the time window (fromDateTime/toDateTime) or add a filter ' +
+	'(user, account, or scope) and search again.\n';
+
 function buildHeader(count: number, totalBeforeFilter?: number): string {
 	if (totalBeforeFilter !== undefined && totalBeforeFilter !== count) {
 		return `**Calls** (${count} of ${totalBeforeFilter} matched)\n`;
@@ -144,13 +159,21 @@ function buildCompactTable(response: CallDetailsResponse): string[] {
  * trackers whose name matches one of the supplied needles
  * (case-insensitive substring). Without a filter, all non-zero
  * trackers are shown.
+ *
+ * truncated marks a search that ran out of pages before Gong ran out of
+ * results. Saying so in the output is the point: otherwise the caller reasons
+ * over a partial set believing it is the whole one, and reports a confident
+ * answer drawn from the first N pages only.
  */
 export function formatCallDetailsResponse(
 	response: CallDetailsResponse,
 	totalBeforeFilter?: number,
 	trackerFilter?: string[],
+	truncated?: boolean,
 ): string {
-	const header = buildHeader(response.calls.length, totalBeforeFilter);
+	const header = truncated
+		? `${buildHeader(response.calls.length, totalBeforeFilter)}${TRUNCATED_WARNING}`
+		: buildHeader(response.calls.length, totalBeforeFilter);
 
 	if (response.calls.length === 0) {
 		return `${header}No calls found.`;

@@ -760,7 +760,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 			case 'search_calls': {
 				// Validate input with Zod schema (will throw ZodError if invalid)
 				const validated = searchCallsRequestSchema.parse(args ?? {});
-				const { response, totalBeforeFilter } =
+				const { response, totalBeforeFilter, truncated } =
 					await gong.searchCallsAll(validated);
 				return {
 					content: [
@@ -770,6 +770,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 								response,
 								totalBeforeFilter,
 								validated.trackers,
+								truncated,
 							),
 						},
 					],

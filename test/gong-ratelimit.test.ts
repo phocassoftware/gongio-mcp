@@ -5,6 +5,7 @@ import {
 	GongRateLimitError,
 	parseRetryAfterMs,
 	RateLimiter,
+	requestPath,
 } from '../src/gong.js';
 import type { CallDetailsResponse } from '../src/schemas.js';
 
@@ -69,6 +70,17 @@ describe('parseRetryAfterMs', () => {
 	it('returns undefined for missing/garbage headers', () => {
 		expect(parseRetryAfterMs(null)).toBeUndefined();
 		expect(parseRetryAfterMs('not-a-date')).toBeUndefined();
+	});
+});
+
+describe('requestPath', () => {
+	it('keeps the path and drops the opaque cursor query', () => {
+		expect(
+			requestPath('https://api.gong.io/v2/calls?cursor=abc123&limit=100'),
+		).toBe('/v2/calls');
+	});
+	it('falls back to the raw string when the URL will not parse', () => {
+		expect(requestPath('/v2/calls')).toBe('/v2/calls');
 	});
 });
 
@@ -187,6 +199,63 @@ describe('GongClient 429 handling', () => {
 		expect(err.message).toMatch(/wait about 60 seconds/); // Retry-After surfaced plainly
 		expect(fetchMock).toHaveBeenCalledTimes(1); // did not retry
 		expect(sleeps).toEqual([]); // never slept into the 60s
+	});
+
+	it('logs every 429 retry to stderr with path, attempt and wait', async () => {
+		// The only trace throttling leaves: a retried 429 succeeds silently, and
+		// the container's middleware logs the HTTP 200 that carries a tool error.
+		fetchMock
+			.mockResolvedValueOnce(mockResponse({ status: 429, retryAfter: '2' }))
+			.mockResolvedValueOnce(mockResponse({ status: 200, body: EMPTY_CALLS }));
+		const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+		await makeClient().searchCalls({});
+
+		expect(stderr).toHaveBeenCalledTimes(1);
+		const line = stderr.mock.calls[0]?.[0] as string;
+		expect(line).toContain('gong 429 retrying:');
+		expect(line).toContain('path=/v2/calls/extensive');
+		expect(line).toContain('attempt=1');
+		expect(line).toContain('waitMs=2000');
+		expect(line).toContain('retryAfterMs=2000');
+	});
+
+	it('logs the give-up with the reason it stopped', async () => {
+		fetchMock.mockResolvedValue(mockResponse({ status: 429 }));
+		const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+		await makeClient(1)
+			.searchCalls({})
+			.catch(() => undefined);
+
+		const lines = stderr.mock.calls.map((c) => c[0] as string);
+		// One retry line, then the give-up line naming the bound that ended it.
+		expect(lines.filter((l) => l.includes('gong 429 retrying:'))).toHaveLength(
+			1,
+		);
+		const gaveUp = lines.find((l) => l.includes('gong 429 gave up:'));
+		expect(gaveUp).toBeDefined();
+		expect(gaveUp).toContain('attempts=2');
+		expect(gaveUp).toContain('reason=retries-exhausted');
+	});
+
+	it('labels a give-up forced by the wall-clock budget', async () => {
+		fetchMock.mockResolvedValue(
+			mockResponse({ status: 429, retryAfter: '60' }),
+		);
+		const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+		const client = new GongClient(
+			{ accessKey: 'k', accessKeySecret: 's' },
+			{ maxRps: 0, maxRetries: 5, maxRetryMs: 20_000, now: () => 0 },
+		);
+
+		await client.searchCalls({}).catch(() => undefined);
+
+		const gaveUp = stderr.mock.calls
+			.map((c) => c[0] as string)
+			.find((l) => l.includes('gong 429 gave up:'));
+		expect(gaveUp).toContain('reason=budget-exhausted');
+		expect(gaveUp).toContain('retryAfterMs=60000');
 	});
 
 	it('stops retrying once the wall-clock budget is spent (not just maxRetries)', async () => {
