@@ -147,7 +147,11 @@ describe('formatCallDetailsResponse', () => {
 			true,
 		);
 		expect(truncated).toContain('Partial results');
+		// Points only at arguments Gong itself filters on — the ones that actually
+		// shorten the walk — and warns off the post-pagination filters.
 		expect(truncated).toContain('fromDateTime/toDateTime');
+		expect(truncated).toContain('primaryUserIds');
+		expect(truncated).toMatch(/customerName, scope and trackers are applied/);
 
 		// End users see the consequence, never the mechanics: no server-side knob
 		// name, no page/quota counts. Those go to the container log only.

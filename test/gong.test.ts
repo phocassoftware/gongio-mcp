@@ -836,9 +836,18 @@ describe('GongClient', () => {
 		it('defaults the page cap well below the old 50 (daily quota)', () => {
 			// Gong allows 10,000 requests/day company-wide. One search that walks
 			// 50 pages spends 0.5% of that; 144 of them in a day (2026-08-20) spent
-			// most of it. Guards against the cap drifting back up.
-			expect(MAX_SEARCH_PAGES).toBeLessThanOrEqual(10);
-			expect(MAX_SEARCH_PAGES).toBeGreaterThan(0);
+			// most of it. Guards against the default drifting back up.
+			//
+			// The constant is read from GONG_MAX_SEARCH_PAGES at import time, so an
+			// operator override in the runner's environment is legitimate — assert
+			// the clamp then, not the default.
+			const override = process.env.GONG_MAX_SEARCH_PAGES;
+			if (override === undefined || override === '') {
+				expect(MAX_SEARCH_PAGES).toBe(10);
+			} else {
+				expect(MAX_SEARCH_PAGES).toBeGreaterThanOrEqual(1);
+				expect(MAX_SEARCH_PAGES).toBeLessThanOrEqual(50);
+			}
 		});
 
 		it('does not flag truncated when the last page has no cursor', async () => {

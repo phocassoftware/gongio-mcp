@@ -617,8 +617,11 @@ export class GongClient {
 			const jitter = backoff * 0.25 * Math.random();
 			const waitMs = retryAfterMs ?? backoff + jitter;
 
-			const remainingMs = this.maxRetryMs - (this.nowFn() - startedAt);
+			// One clock read per iteration: the budget decision and the log line
+			// must agree, and an injected clock that advances per call would
+			// otherwise spend budget on the logging.
 			const elapsedMs = this.nowFn() - startedAt;
+			const remainingMs = this.maxRetryMs - elapsedMs;
 			const path = requestPath(url);
 			if (attempt >= this.maxRetries || waitMs >= remainingMs) {
 				const reason =

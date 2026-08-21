@@ -105,18 +105,26 @@ export const MAX_OUTPUT_LENGTH =
 
 /**
  * Prepended to a search whose pagination hit MAX_SEARCH_PAGES. Says only what
- * the caller can act on: the list is incomplete, and which tool arguments
- * narrow it. No mechanics — no page counts, no quota, and never the name of a
- * server-side knob like GONG_MAX_SEARCH_PAGES. Those belong in the container
- * log (see searchCallsAll), which operators read and end users do not; the same
- * split GongRateLimitError keeps. fromDateTime/toDateTime and the filter names
- * stay because they are this tool's own arguments, not internal config.
+ * the caller can act on: the list is incomplete, and which arguments actually
+ * shorten the walk. No mechanics — no page counts, no quota, and never the name
+ * of a server-side knob like GONG_MAX_SEARCH_PAGES. Those belong in the
+ * container log (see searchCallsAll), which operators read and end users do not;
+ * the same split GongRateLimitError keeps. Argument names stay: they are this
+ * tool's own inputs, not internal config, and the caller needs them to retry.
+ *
+ * Only the arguments Gong filters on (fromDateTime, toDateTime, workspaceId,
+ * primaryUserIds, callIds) reduce the number of pages fetched. The rest —
+ * customerName, scope, trackers, titleContains, the participant lists — are
+ * applied here, after pagination, so they cannot recover a call that was never
+ * fetched. Naming them as a fix would send the caller in a circle.
  */
 const TRUNCATED_WARNING =
 	'> ⚠️ Partial results — this search reached its limit before returning every ' +
 	'matching call, so some calls are missing. Do not present it as a complete ' +
-	'list: narrow the time window (fromDateTime/toDateTime) or add a filter ' +
-	'(user, account, or scope) and search again.\n';
+	'list: narrow the time window (fromDateTime/toDateTime), or restrict it with ' +
+	'primaryUserIds, workspaceId or callIds, and search again. Note that ' +
+	'customerName, scope and trackers are applied after the search and will not ' +
+	'bring back the missing calls.\n';
 
 function buildHeader(count: number, totalBeforeFilter?: number): string {
 	if (totalBeforeFilter !== undefined && totalBeforeFilter !== count) {
