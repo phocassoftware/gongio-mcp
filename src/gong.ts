@@ -432,22 +432,62 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
+ * A wait in words. Gong's Retry-After spans two very different situations —
+ * seconds when a burst is being paced, over an hour once the shared allowance
+ * for the day is gone — and "about 4808 seconds" (seen in production on
+ * 2026-08-21) is not a sentence a salesperson can act on.
+ */
+export function formatRetryWait(ms: number): string {
+	const seconds = Math.max(1, Math.round(ms / 1000));
+	if (seconds < 60) {
+		return seconds === 1 ? 'about a second' : `about ${seconds} seconds`;
+	}
+
+	const minutes = Math.round(seconds / 60);
+	if (minutes < 60) {
+		return minutes === 1 ? 'about a minute' : `about ${minutes} minutes`;
+	}
+
+	const hours = Math.floor(minutes / 60);
+	const rest = minutes % 60;
+	const hoursPart = hours === 1 ? 'about an hour' : `about ${hours} hours`;
+	// Sub-5-minute precision is noise at this range ("about 2 hours" beats
+	// "about 2 hours and 3 minutes").
+	if (rest < 5) return hoursPart;
+	return `${hoursPart} and ${rest} minutes`;
+}
+
+/**
+ * A Retry-After longer than this means Gong is not pacing a burst — the
+ * allowance itself is spent, and no amount of narrowing gets a request through
+ * until the window rolls over. The advice has to change with it: telling
+ * someone to narrow their request when the answer is "wait" sends them round in
+ * circles retrying variations, each one another failed request.
+ */
+const LONG_WAIT_MS = 5 * 60 * 1000;
+
+/**
  * Thrown when Gong keeps returning HTTP 429 and the client's retry budget is
  * exhausted. The message is written for business users (Customer Success):
- * a plain "temporarily rate-limited, try again / narrow the request" — no
- * mention of the underlying quota mechanics. Surfaced through the MCP tool
- * instead of a raw 429 body or a silent timeout.
+ * plain language, a wait in words, and advice that matches the situation — no
+ * quota mechanics, no raw 429 body, no server-side knob names. Surfaced through
+ * the MCP tool instead of a hang or a raw error body.
  */
 export class GongRateLimitError extends Error {
 	constructor(retryAfterMs?: number) {
-		const wait = retryAfterMs
-			? `about ${Math.max(1, Math.round(retryAfterMs / 1000))} seconds`
-			: 'a minute';
 		super(
-			`Gong is temporarily rate-limiting requests, so this one couldn't be ` +
-				`completed. Please wait ${wait} and try again — or narrow your ` +
-				`request (e.g. a single call or a specific date range) so it ` +
-				`retrieves less data. If the issue continues, please contact IT.`,
+			retryAfterMs !== undefined && retryAfterMs >= LONG_WAIT_MS
+				? `Gong is temporarily rate-limiting requests, so this one couldn't ` +
+						`be completed. The limit is shared across everyone here and ` +
+						`clears in ${formatRetryWait(retryAfterMs)} — until then, ` +
+						`retrying or narrowing this request won't get through. Please ` +
+						`try again after that, and contact IT if you need the data sooner.`
+				: `Gong is temporarily rate-limiting requests, so this one couldn't ` +
+						`be completed. Please wait ` +
+						`${retryAfterMs === undefined ? 'a minute' : formatRetryWait(retryAfterMs)} ` +
+						`and try again — or narrow your request (e.g. a single call or a ` +
+						`specific date range) so it retrieves less data. If the issue ` +
+						`continues, please contact IT.`,
 		);
 		this.name = 'GongRateLimitError';
 	}
