@@ -104,6 +104,26 @@ export const MAX_OUTPUT_LENGTH =
 	Number.parseInt(process.env.MAX_MCP_OUTPUT_LENGTH ?? '', 10) || 50000;
 
 /**
+ * Shown when the search had no start date and a window was applied for it.
+ * Silence here would be the worst option: the caller asked without a start
+ * date, got a slice, and would report the slice as the whole picture. It names
+ * the resolved start rather than only the length, because a caller that passed
+ * toDateTime got the window *before that date* — not the last N days — and
+ * naming the argument is how it asks for a different period next time.
+ */
+function defaultedWindowNote(window: {
+	days: number;
+	fromDateTime: string;
+}): string {
+	const from = window.fromDateTime.slice(0, 10);
+	return (
+		`> \u2139\uFE0F No start date was given, so this searched only a **${window.days}-day ` +
+		`window from ${from}**. Calls outside it were not looked at. Pass ` +
+		`fromDateTime (and optionally toDateTime) to search a different period.\n`
+	);
+}
+
+/**
  * Prepended to a search whose pagination hit MAX_SEARCH_PAGES. Says only what
  * the caller can act on: the list is incomplete, and which arguments actually
  * shorten the walk. No mechanics — no page counts, no quota, and never the name
@@ -178,10 +198,16 @@ export function formatCallDetailsResponse(
 	totalBeforeFilter?: number,
 	trackerFilter?: string[],
 	truncated?: boolean,
+	defaultedWindow?: { days: number; fromDateTime: string },
 ): string {
-	const header = truncated
-		? `${buildHeader(response.calls.length, totalBeforeFilter)}${TRUNCATED_WARNING}`
-		: buildHeader(response.calls.length, totalBeforeFilter);
+	let header = buildHeader(response.calls.length, totalBeforeFilter);
+	// Order matters: say what was searched before saying it was cut short.
+	if (defaultedWindow) {
+		header += defaultedWindowNote(defaultedWindow);
+	}
+	if (truncated) {
+		header += TRUNCATED_WARNING;
+	}
 
 	if (response.calls.length === 0) {
 		return `${header}No calls found.`;

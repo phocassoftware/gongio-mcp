@@ -17,6 +17,7 @@ import {
 	filterBySystem,
 	filterByTitleContains,
 	filterByTrackers,
+	DEFAULT_SEARCH_WINDOW_DAYS,
 	MAX_SEARCH_PAGES,
 } from '../src/gong.js';
 import type {
@@ -827,8 +828,13 @@ describe('GongClient', () => {
 			expect(fetchMock).toHaveBeenCalledTimes(MAX_SEARCH_PAGES);
 			expect(response.calls).toHaveLength(MAX_SEARCH_PAGES);
 			expect(truncated).toBe(true);
-			expect(stderr).toHaveBeenCalledTimes(1);
-			expect(stderr.mock.calls[0][0]).toMatch(
+			// This search also has no fromDateTime, so the default-window line is
+			// logged alongside; assert on the page-limit line itself.
+			const pageLimitLines = stderr.mock.calls
+				.map((c) => c[0] as string)
+				.filter((l) => l.includes('page limit reached'));
+			expect(pageLimitLines).toHaveLength(1);
+			expect(pageLimitLines[0]).toMatch(
 				new RegExp(`page limit reached: pages=${MAX_SEARCH_PAGES}`),
 			);
 		});
@@ -850,6 +856,108 @@ describe('GongClient', () => {
 			}
 		});
 
+		describe('default date window', () => {
+			// Frozen clock: 2026-08-24T00:00:00Z.
+			const NOW = Date.parse('2026-08-24T00:00:00.000Z');
+			const onePage: CallDetailsResponse = {
+				requestId: 'req-1',
+				records: { totalRecords: 1, currentPageSize: 1, currentPageNumber: 0 },
+				calls: [{ metaData: { id: '1', title: 'Call 1' } }],
+			};
+
+			function clientAt(now: number) {
+				return new GongClient(
+					{ accessKey: 'test-key', accessKeySecret: 'test-secret' },
+					{ maxRps: 0, now: () => now },
+				);
+			}
+
+			function sentFilter(call: number) {
+				return JSON.parse(fetchMock.mock.calls[call][1].body).filter;
+			}
+
+			it('bounds an unbounded search to the default window and says so', async () => {
+				fetchMock.mockResolvedValue({ ok: true, json: async () => onePage });
+				const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+				const { defaultedWindow } = await clientAt(NOW).searchCallsAll({});
+
+				const expectedFrom = new Date(
+					NOW - DEFAULT_SEARCH_WINDOW_DAYS * 86_400_000,
+				).toISOString();
+				expect(sentFilter(0).fromDateTime).toBe(expectedFrom);
+				expect(defaultedWindow).toEqual({
+					days: DEFAULT_SEARCH_WINDOW_DAYS,
+					fromDateTime: expectedFrom,
+				});
+				expect(stderr.mock.calls[0]?.[0]).toMatch(
+					/no fromDateTime given, defaulting to \d+ days/,
+				);
+			});
+
+			it('anchors the window to toDateTime when only an end date is given', async () => {
+				// Counting back from *now* here would put fromDateTime after
+				// toDateTime and return nothing for a legitimate "before X" search.
+				fetchMock.mockResolvedValue({ ok: true, json: async () => onePage });
+				vi.spyOn(console, 'error').mockImplementation(() => {});
+
+				const { defaultedWindow } = await clientAt(NOW).searchCallsAll({
+					toDateTime: '2025-03-01T00:00:00Z',
+				});
+
+				const filter = sentFilter(0);
+				expect(filter.fromDateTime).toBe(
+					new Date(
+						Date.parse('2025-03-01T00:00:00Z') -
+							DEFAULT_SEARCH_WINDOW_DAYS * 86_400_000,
+					).toISOString(),
+				);
+				expect(Date.parse(filter.fromDateTime)).toBeLessThan(
+					Date.parse(filter.toDateTime),
+				);
+				expect(defaultedWindow?.fromDateTime).toBe(filter.fromDateTime);
+			});
+
+			it('leaves an explicit fromDateTime alone, however old', async () => {
+				fetchMock.mockResolvedValue({ ok: true, json: async () => onePage });
+
+				const { defaultedWindow } = await clientAt(NOW).searchCallsAll({
+					fromDateTime: '2020-01-01T00:00:00Z',
+				});
+
+				expect(sentFilter(0).fromDateTime).toBe('2020-01-01T00:00:00Z');
+				expect(defaultedWindow).toBeUndefined();
+			});
+
+			it('does not window a search that names callIds', async () => {
+				// A window could exclude the very calls asked for, and an id list is
+				// already bounded.
+				fetchMock.mockResolvedValue({ ok: true, json: async () => onePage });
+
+				const { defaultedWindow } = await clientAt(NOW).searchCallsAll({
+					callIds: ['123', '456'],
+				});
+
+				expect(sentFilter(0).fromDateTime).toBeUndefined();
+				expect(defaultedWindow).toBeUndefined();
+			});
+
+			it('defaults to a window that fits inside the page cap', () => {
+				// The whole point of the default: a window that still trips the cap
+				// costs the same requests as no window at all and truncates anyway.
+				// 7 days measured at 427 calls (~61/day) against a ~1000-call
+				// ceiling; 30 and 90 days both measured as full cap hits. An
+				// operator override is legitimate, so only the default is pinned.
+				const override = process.env.GONG_DEFAULT_SEARCH_DAYS;
+				if (override === undefined || override === '') {
+					expect(DEFAULT_SEARCH_WINDOW_DAYS).toBe(7);
+				} else {
+					expect(DEFAULT_SEARCH_WINDOW_DAYS).toBeGreaterThanOrEqual(1);
+					expect(DEFAULT_SEARCH_WINDOW_DAYS).toBeLessThanOrEqual(3650);
+				}
+			});
+		});
+
 		it('does not flag truncated when the last page has no cursor', async () => {
 			const onlyPage: CallDetailsResponse = {
 				requestId: 'req-1',
@@ -862,7 +970,11 @@ describe('GongClient', () => {
 			const { truncated } = await client.searchCallsAll({});
 
 			expect(truncated).toBe(false);
-			expect(stderr).not.toHaveBeenCalled();
+			expect(
+				stderr.mock.calls
+					.map((c) => c[0] as string)
+					.filter((l) => l.includes('page limit reached')),
+			).toHaveLength(0);
 		});
 
 		it('returns empty results for no calls', async () => {

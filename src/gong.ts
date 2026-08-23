@@ -427,6 +427,40 @@ export const MAX_SEARCH_PAGES = envNumber(
 	50,
 );
 
+/**
+ * Window applied to a search_calls call that arrives with no fromDateTime.
+ *
+ * The tool description has always said a date range is strongly recommended,
+ * and it is routinely ignored: on 2026-08-23 one twelve-minute session ran 115
+ * searches, 104 of which walked the full page cap because they were unbounded.
+ * Each of those spends MAX_SEARCH_PAGES requests of a 10,000/day company
+ * allowance and returns a truncated answer anyway, which invites a retry — the
+ * loop that emptied the allowance twice that week.
+ *
+ * A default window beats making the argument mandatory: a rejected call is a
+ * cheap failure for the server, but an LLM caller answers it by retrying with a
+ * guess, so the requests arrive regardless. Bounding the walk and saying what
+ * was bounded gets the cost down without the round trip.
+ *
+ * Seven days is chosen to fit *inside* the page cap, which is the only way a
+ * default saves anything. Measured 2026-08-23: 427 calls in 7 days (~61/day)
+ * against a 1000-call ceiling (MAX_SEARCH_PAGES × ~100). A wider default would
+ * be self-defeating — 30 days measured as a full cap hit, costing the same ten
+ * requests an unbounded search costs and still returning a truncated answer.
+ * Fitting the cap instead means the walk ends on its own and the result is
+ * complete for the period, rather than 1000 calls in an order Gong does not
+ * document.
+ *
+ * Callers may still ask for any period explicitly; the page cap remains the
+ * backstop for those, with the truncation notice to match.
+ */
+export const DEFAULT_SEARCH_WINDOW_DAYS = envNumber(
+	process.env.GONG_DEFAULT_SEARCH_DAYS,
+	7,
+	1,
+	3650,
+);
+
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -908,6 +942,12 @@ export class GongClient {
 		totalBeforeFilter: number;
 		/** True when the page limit stopped the walk with results still unread. */
 		truncated: boolean;
+		/**
+		 * Set when no fromDateTime was supplied and a window was applied instead:
+		 * its length, and the start it resolved to. The caller has to be told —
+		 * it asked without a start date and got a slice.
+		 */
+		defaultedWindow?: { days: number; fromDateTime: string };
 	}> {
 		const allCalls: CallDetails[] = [];
 		let cursor: string | undefined;
@@ -926,9 +966,37 @@ export class GongClient {
 				? Array.from(new Set(requiredInclude))
 				: undefined;
 
+		// An unbounded search walks the whole workspace until the page cap stops
+		// it. Bound it to a default window instead — but never when callIds names
+		// the calls outright, since a window could exclude exactly what was asked
+		// for, and such a search is already bounded by the id list.
+		let defaultedWindow: { days: number; fromDateTime: string } | undefined;
+		let fromDateTime = options.fromDateTime;
+		if (!fromDateTime && !options.callIds?.length) {
+			const days = DEFAULT_SEARCH_WINDOW_DAYS;
+			// Anchor to toDateTime when the caller gave one: a search for "before
+			// March" supplies only an end, and counting back from *now* would
+			// produce fromDateTime > toDateTime and an empty result. Falls back to
+			// the clock for an unparseable value, which the schema should have
+			// rejected already.
+			const anchor = options.toDateTime
+				? Date.parse(options.toDateTime)
+				: Number.NaN;
+			const endsAt = Number.isNaN(anchor) ? this.nowFn() : anchor;
+			fromDateTime = new Date(
+				endsAt - days * 24 * 60 * 60 * 1000,
+			).toISOString();
+			defaultedWindow = { days, fromDateTime };
+			console.error(
+				`search_calls: no fromDateTime given, defaulting to ${days} days ` +
+					`(from=${fromDateTime}${options.toDateTime ? ` to=${options.toDateTime}` : ''}) ` +
+					`— override with GONG_DEFAULT_SEARCH_DAYS`,
+			);
+		}
+
 		// Only pass server-side filter options to the API
 		const apiOptions = {
-			fromDateTime: options.fromDateTime,
+			fromDateTime,
 			toDateTime: options.toDateTime,
 			workspaceId: options.workspaceId,
 			primaryUserIds: options.primaryUserIds,
@@ -1036,6 +1104,7 @@ export class GongClient {
 			},
 			totalBeforeFilter,
 			truncated,
+			defaultedWindow,
 		};
 	}
 
