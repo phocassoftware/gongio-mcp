@@ -184,7 +184,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 					`Search Gong calls with rich filters. The primary tool for narrowing down calls before drilling in with get_call_summary or get_call_transcript.
 
 Supported filters:
-- When: fromDateTime, toDateTime (ISO 8601). Always prefer a date range — unbounded queries pull every call in the workspace.
+- When: fromDateTime, toDateTime (ISO 8601). Omitting fromDateTime does NOT search all time — it searches the last 7 days only, and the result says so. Pass fromDateTime explicitly whenever the question reaches further back; any period is allowed, but a single search still stops at a fixed page limit, so prefer the tightest range that answers the question and split long periods across several searches rather than one sweep.
 - Who hosted: primaryUserIds, primaryUserEmails, excludePrimaryUserIds.
 - Who participated (host OR attendee OR invitee): participantUserIds, participantEmails, excludeParticipantUserIds, excludeParticipantEmails.
 - Customer/topic: customerName (CRM account name, email domain, or title substring), titleContains, trackers (see note below).
@@ -760,8 +760,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 			case 'search_calls': {
 				// Validate input with Zod schema (will throw ZodError if invalid)
 				const validated = searchCallsRequestSchema.parse(args ?? {});
-				const { response, totalBeforeFilter, truncated } =
-					await gong.searchCallsAll(validated);
+				const {
+					response,
+					totalBeforeFilter,
+					truncated,
+					defaultedWindowDays,
+				} = await gong.searchCallsAll(validated);
 				return {
 					content: [
 						{
@@ -771,6 +775,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 								totalBeforeFilter,
 								validated.trackers,
 								truncated,
+								defaultedWindowDays,
 							),
 						},
 					],

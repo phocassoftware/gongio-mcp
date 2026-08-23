@@ -17,6 +17,7 @@ import {
 	filterBySystem,
 	filterByTitleContains,
 	filterByTrackers,
+	DEFAULT_SEARCH_WINDOW_DAYS,
 	MAX_SEARCH_PAGES,
 } from '../src/gong.js';
 import type {
@@ -827,8 +828,13 @@ describe('GongClient', () => {
 			expect(fetchMock).toHaveBeenCalledTimes(MAX_SEARCH_PAGES);
 			expect(response.calls).toHaveLength(MAX_SEARCH_PAGES);
 			expect(truncated).toBe(true);
-			expect(stderr).toHaveBeenCalledTimes(1);
-			expect(stderr.mock.calls[0][0]).toMatch(
+			// This search also has no fromDateTime, so the default-window line is
+			// logged alongside; assert on the page-limit line itself.
+			const pageLimitLines = stderr.mock.calls
+				.map((c) => c[0] as string)
+				.filter((l) => l.includes('page limit reached'));
+			expect(pageLimitLines).toHaveLength(1);
+			expect(pageLimitLines[0]).toMatch(
 				new RegExp(`page limit reached: pages=${MAX_SEARCH_PAGES}`),
 			);
 		});
@@ -850,6 +856,73 @@ describe('GongClient', () => {
 			}
 		});
 
+		describe('default date window', () => {
+			// Frozen clock: 2026-08-24T00:00:00Z.
+			const NOW = Date.parse('2026-08-24T00:00:00.000Z');
+			const onePage: CallDetailsResponse = {
+				requestId: 'req-1',
+				records: { totalRecords: 1, currentPageSize: 1, currentPageNumber: 0 },
+				calls: [{ metaData: { id: '1', title: 'Call 1' } }],
+			};
+
+			function clientAt(now: number) {
+				return new GongClient(
+					{ accessKey: 'test-key', accessKeySecret: 'test-secret' },
+					{ maxRps: 0, now: () => now },
+				);
+			}
+
+			function sentFilter(call: number) {
+				return JSON.parse(fetchMock.mock.calls[call][1].body).filter;
+			}
+
+			it('bounds an unbounded search to the default window and says so', async () => {
+				fetchMock.mockResolvedValue({ ok: true, json: async () => onePage });
+				const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+				const { defaultedWindowDays } = await clientAt(NOW).searchCallsAll({});
+
+				// 7 days before the frozen clock.
+				expect(sentFilter(0).fromDateTime).toBe('2026-08-17T00:00:00.000Z');
+				expect(defaultedWindowDays).toBe(DEFAULT_SEARCH_WINDOW_DAYS);
+				expect(stderr.mock.calls[0]?.[0]).toMatch(
+					/no fromDateTime given, defaulting to the last \d+ days/,
+				);
+			});
+
+			it('leaves an explicit fromDateTime alone, however old', async () => {
+				fetchMock.mockResolvedValue({ ok: true, json: async () => onePage });
+
+				const { defaultedWindowDays } = await clientAt(NOW).searchCallsAll({
+					fromDateTime: '2020-01-01T00:00:00Z',
+				});
+
+				expect(sentFilter(0).fromDateTime).toBe('2020-01-01T00:00:00Z');
+				expect(defaultedWindowDays).toBeUndefined();
+			});
+
+			it('does not window a search that names callIds', async () => {
+				// A window could exclude the very calls asked for, and an id list is
+				// already bounded.
+				fetchMock.mockResolvedValue({ ok: true, json: async () => onePage });
+
+				const { defaultedWindowDays } = await clientAt(NOW).searchCallsAll({
+					callIds: ['123', '456'],
+				});
+
+				expect(sentFilter(0).fromDateTime).toBeUndefined();
+				expect(defaultedWindowDays).toBeUndefined();
+			});
+
+			it('fits inside the page cap by construction', () => {
+				// The whole point of the default: a window that still trips the cap
+				// costs the same requests as no window at all, and truncates anyway.
+				// ~61 calls/day measured, ~100 calls per page.
+				const estimatedPages = (DEFAULT_SEARCH_WINDOW_DAYS * 61) / 100;
+				expect(estimatedPages).toBeLessThan(MAX_SEARCH_PAGES);
+			});
+		});
+
 		it('does not flag truncated when the last page has no cursor', async () => {
 			const onlyPage: CallDetailsResponse = {
 				requestId: 'req-1',
@@ -862,7 +935,11 @@ describe('GongClient', () => {
 			const { truncated } = await client.searchCallsAll({});
 
 			expect(truncated).toBe(false);
-			expect(stderr).not.toHaveBeenCalled();
+			expect(
+				stderr.mock.calls
+					.map((c) => c[0] as string)
+					.filter((l) => l.includes('page limit reached')),
+			).toHaveLength(0);
 		});
 
 		it('returns empty results for no calls', async () => {

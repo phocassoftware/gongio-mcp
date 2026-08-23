@@ -164,6 +164,44 @@ describe('formatCallDetailsResponse', () => {
 		);
 	});
 
+	it('discloses a defaulted date window, and stacks with truncation', () => {
+		const response: CallDetailsResponse = {
+			requestId: 'test-123',
+			records: { totalRecords: 1, currentPageSize: 1, currentPageNumber: 1 },
+			calls: [{ metaData: { id: '123', title: 'Sales Call' } }],
+		};
+
+		const windowed = formatCallDetailsResponse(
+			response,
+			undefined,
+			undefined,
+			false,
+			7,
+		);
+		expect(windowed).toContain('last 7 days');
+		expect(windowed).toContain('fromDateTime');
+		// A complete answer for the window carries no truncation caveat.
+		expect(windowed).not.toContain('Partial results');
+
+		// Both can apply: windowed and still too broad for the page cap.
+		const both = formatCallDetailsResponse(
+			response,
+			undefined,
+			undefined,
+			true,
+			7,
+		);
+		expect(both).toContain('last 7 days');
+		expect(both).toContain('Partial results');
+		// Says what was searched before saying it was cut short.
+		expect(both.indexOf('last 7 days')).toBeLessThan(
+			both.indexOf('Partial results'),
+		);
+
+		// Silent when the caller gave a range of its own.
+		expect(formatCallDetailsResponse(response)).not.toContain('No date range');
+	});
+
 	it('formats calls as markdown table from CallDetailsResponse', () => {
 		const response: CallDetailsResponse = {
 			requestId: 'test-123',

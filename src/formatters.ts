@@ -118,6 +118,21 @@ export const MAX_OUTPUT_LENGTH =
  * applied here, after pagination, so they cannot recover a call that was never
  * fetched. Naming them as a fix would send the caller in a circle.
  */
+/**
+ * Shown when the search had no fromDateTime and a window was applied for it.
+ * Silence here would be the worst option: the caller asked about all time,
+ * got a slice, and would report the slice as the whole picture. Naming the
+ * argument matters as much as naming the window — that is how the caller asks
+ * for a different period next time rather than assuming none exists.
+ */
+function defaultedWindowNote(days: number): string {
+	return (
+		`> ℹ️ No date range was given, so this searched only the **last ${days} ` +
+		`days**. Older calls were not looked at. Pass fromDateTime (and ` +
+		`optionally toDateTime) to search a different period.\n`
+	);
+}
+
 const TRUNCATED_WARNING =
 	'> ⚠️ Partial results — this search reached its limit before returning every ' +
 	'matching call, so some calls are missing. Do not present it as a complete ' +
@@ -178,10 +193,16 @@ export function formatCallDetailsResponse(
 	totalBeforeFilter?: number,
 	trackerFilter?: string[],
 	truncated?: boolean,
+	defaultedWindowDays?: number,
 ): string {
-	const header = truncated
-		? `${buildHeader(response.calls.length, totalBeforeFilter)}${TRUNCATED_WARNING}`
-		: buildHeader(response.calls.length, totalBeforeFilter);
+	let header = buildHeader(response.calls.length, totalBeforeFilter);
+	// Order matters: say what was searched before saying it was cut short.
+	if (defaultedWindowDays !== undefined) {
+		header += defaultedWindowNote(defaultedWindowDays);
+	}
+	if (truncated) {
+		header += TRUNCATED_WARNING;
+	}
 
 	if (response.calls.length === 0) {
 		return `${header}No calls found.`;
