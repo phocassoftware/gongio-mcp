@@ -23,7 +23,7 @@ import {
 	formatUsersResponse,
 	formatWorkspacesResponse,
 } from './formatters.js';
-import { GongClient } from './gong.js';
+import { DEFAULT_SEARCH_WINDOW_DAYS, GongClient } from './gong.js';
 import {
 	getCallRequestSchema,
 	getCallSummaryRequestSchema,
@@ -184,7 +184,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 					`Search Gong calls with rich filters. The primary tool for narrowing down calls before drilling in with get_call_summary or get_call_transcript.
 
 Supported filters:
-- When: fromDateTime, toDateTime (ISO 8601). Omitting fromDateTime does NOT search all time — it searches the last 7 days only, and the result says so. Pass fromDateTime explicitly whenever the question reaches further back; any period is allowed, but a single search still stops at a fixed page limit, so prefer the tightest range that answers the question and split long periods across several searches rather than one sweep.
+- When: fromDateTime, toDateTime (ISO 8601). Omitting fromDateTime does NOT search all time — it searches a recent window only (currently ${DEFAULT_SEARCH_WINDOW_DAYS} days), and the result says which. Pass fromDateTime explicitly whenever the question reaches further back; any period is allowed, but a single search still stops at a fixed page limit, so prefer the tightest range that answers the question and split long periods across several searches rather than one sweep.
 - Who hosted: primaryUserIds, primaryUserEmails, excludePrimaryUserIds.
 - Who participated (host OR attendee OR invitee): participantUserIds, participantEmails, excludeParticipantUserIds, excludeParticipantEmails.
 - Customer/topic: customerName (CRM account name, email domain, or title substring), titleContains, trackers (see note below).
@@ -192,7 +192,7 @@ Supported filters:
 - Output shape: include (array of keyPoints, trackers, highlights, speakers, comments, context, outline, media). Parties + brief + topics are always returned.
 
 Behavior:
-- Auto-paginates up to ~5000 calls. If a user asks for a broad question, guide them to narrow with a date range, scope, minDuration, or customerName first.
+- Auto-paginates, but stops at a fixed page limit (~1000 calls) and says so when it does. A broad question is better answered by several narrow searches than one sweep that gets cut off.
 - trackers filter does case-insensitive substring match on tracker names. Names are workspace-specific — call get_trackers first to see what's configured before guessing.
 - When the rich output would exceed the output cap, the tool auto-falls back to a compact table showing all IDs/titles. Use get_call_summary on specific IDs to go deeper.
 - Filters compose with AND logic (primaryUserIds + customerName = hosted by user X on customer Y calls).
@@ -760,12 +760,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 			case 'search_calls': {
 				// Validate input with Zod schema (will throw ZodError if invalid)
 				const validated = searchCallsRequestSchema.parse(args ?? {});
-				const {
-					response,
-					totalBeforeFilter,
-					truncated,
-					defaultedWindowDays,
-				} = await gong.searchCallsAll(validated);
+				const { response, totalBeforeFilter, truncated, defaultedWindow } =
+					await gong.searchCallsAll(validated);
 				return {
 					content: [
 						{
@@ -775,7 +771,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 								totalBeforeFilter,
 								validated.trackers,
 								truncated,
-								defaultedWindowDays,
+								defaultedWindow,
 							),
 						},
 					],

@@ -943,10 +943,11 @@ export class GongClient {
 		/** True when the page limit stopped the walk with results still unread. */
 		truncated: boolean;
 		/**
-		 * Set when no fromDateTime was supplied and a window was applied instead.
-		 * The caller has to be told: it asked about all time and got a slice.
+		 * Set when no fromDateTime was supplied and a window was applied instead:
+		 * its length, and the start it resolved to. The caller has to be told —
+		 * it asked without a start date and got a slice.
 		 */
-		defaultedWindowDays?: number;
+		defaultedWindow?: { days: number; fromDateTime: string };
 	}> {
 		const allCalls: CallDetails[] = [];
 		let cursor: string | undefined;
@@ -969,17 +970,27 @@ export class GongClient {
 		// it. Bound it to a default window instead — but never when callIds names
 		// the calls outright, since a window could exclude exactly what was asked
 		// for, and such a search is already bounded by the id list.
-		let defaultedWindowDays: number | undefined;
+		let defaultedWindow: { days: number; fromDateTime: string } | undefined;
 		let fromDateTime = options.fromDateTime;
 		if (!fromDateTime && !options.callIds?.length) {
-			defaultedWindowDays = DEFAULT_SEARCH_WINDOW_DAYS;
+			const days = DEFAULT_SEARCH_WINDOW_DAYS;
+			// Anchor to toDateTime when the caller gave one: a search for "before
+			// March" supplies only an end, and counting back from *now* would
+			// produce fromDateTime > toDateTime and an empty result. Falls back to
+			// the clock for an unparseable value, which the schema should have
+			// rejected already.
+			const anchor = options.toDateTime
+				? Date.parse(options.toDateTime)
+				: Number.NaN;
+			const endsAt = Number.isNaN(anchor) ? this.nowFn() : anchor;
 			fromDateTime = new Date(
-				this.nowFn() - defaultedWindowDays * 24 * 60 * 60 * 1000,
+				endsAt - days * 24 * 60 * 60 * 1000,
 			).toISOString();
+			defaultedWindow = { days, fromDateTime };
 			console.error(
-				`search_calls: no fromDateTime given, defaulting to the last ` +
-					`${defaultedWindowDays} days (from=${fromDateTime}) — ` +
-					`override with GONG_DEFAULT_SEARCH_DAYS`,
+				`search_calls: no fromDateTime given, defaulting to ${days} days ` +
+					`(from=${fromDateTime}${options.toDateTime ? ` to=${options.toDateTime}` : ''}) ` +
+					`— override with GONG_DEFAULT_SEARCH_DAYS`,
 			);
 		}
 
@@ -1093,7 +1104,7 @@ export class GongClient {
 			},
 			totalBeforeFilter,
 			truncated,
-			defaultedWindowDays,
+			defaultedWindow,
 		};
 	}
 

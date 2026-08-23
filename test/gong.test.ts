@@ -880,25 +880,53 @@ describe('GongClient', () => {
 				fetchMock.mockResolvedValue({ ok: true, json: async () => onePage });
 				const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
 
-				const { defaultedWindowDays } = await clientAt(NOW).searchCallsAll({});
+				const { defaultedWindow } = await clientAt(NOW).searchCallsAll({});
 
-				// 7 days before the frozen clock.
-				expect(sentFilter(0).fromDateTime).toBe('2026-08-17T00:00:00.000Z');
-				expect(defaultedWindowDays).toBe(DEFAULT_SEARCH_WINDOW_DAYS);
+				const expectedFrom = new Date(
+					NOW - DEFAULT_SEARCH_WINDOW_DAYS * 86_400_000,
+				).toISOString();
+				expect(sentFilter(0).fromDateTime).toBe(expectedFrom);
+				expect(defaultedWindow).toEqual({
+					days: DEFAULT_SEARCH_WINDOW_DAYS,
+					fromDateTime: expectedFrom,
+				});
 				expect(stderr.mock.calls[0]?.[0]).toMatch(
-					/no fromDateTime given, defaulting to the last \d+ days/,
+					/no fromDateTime given, defaulting to \d+ days/,
 				);
+			});
+
+			it('anchors the window to toDateTime when only an end date is given', async () => {
+				// Counting back from *now* here would put fromDateTime after
+				// toDateTime and return nothing for a legitimate "before X" search.
+				fetchMock.mockResolvedValue({ ok: true, json: async () => onePage });
+				vi.spyOn(console, 'error').mockImplementation(() => {});
+
+				const { defaultedWindow } = await clientAt(NOW).searchCallsAll({
+					toDateTime: '2025-03-01T00:00:00Z',
+				});
+
+				const filter = sentFilter(0);
+				expect(filter.fromDateTime).toBe(
+					new Date(
+						Date.parse('2025-03-01T00:00:00Z') -
+							DEFAULT_SEARCH_WINDOW_DAYS * 86_400_000,
+					).toISOString(),
+				);
+				expect(Date.parse(filter.fromDateTime)).toBeLessThan(
+					Date.parse(filter.toDateTime),
+				);
+				expect(defaultedWindow?.fromDateTime).toBe(filter.fromDateTime);
 			});
 
 			it('leaves an explicit fromDateTime alone, however old', async () => {
 				fetchMock.mockResolvedValue({ ok: true, json: async () => onePage });
 
-				const { defaultedWindowDays } = await clientAt(NOW).searchCallsAll({
+				const { defaultedWindow } = await clientAt(NOW).searchCallsAll({
 					fromDateTime: '2020-01-01T00:00:00Z',
 				});
 
 				expect(sentFilter(0).fromDateTime).toBe('2020-01-01T00:00:00Z');
-				expect(defaultedWindowDays).toBeUndefined();
+				expect(defaultedWindow).toBeUndefined();
 			});
 
 			it('does not window a search that names callIds', async () => {
@@ -906,20 +934,27 @@ describe('GongClient', () => {
 				// already bounded.
 				fetchMock.mockResolvedValue({ ok: true, json: async () => onePage });
 
-				const { defaultedWindowDays } = await clientAt(NOW).searchCallsAll({
+				const { defaultedWindow } = await clientAt(NOW).searchCallsAll({
 					callIds: ['123', '456'],
 				});
 
 				expect(sentFilter(0).fromDateTime).toBeUndefined();
-				expect(defaultedWindowDays).toBeUndefined();
+				expect(defaultedWindow).toBeUndefined();
 			});
 
-			it('fits inside the page cap by construction', () => {
+			it('defaults to a window that fits inside the page cap', () => {
 				// The whole point of the default: a window that still trips the cap
-				// costs the same requests as no window at all, and truncates anyway.
-				// ~61 calls/day measured, ~100 calls per page.
-				const estimatedPages = (DEFAULT_SEARCH_WINDOW_DAYS * 61) / 100;
-				expect(estimatedPages).toBeLessThan(MAX_SEARCH_PAGES);
+				// costs the same requests as no window at all and truncates anyway.
+				// 7 days measured at 427 calls (~61/day) against a ~1000-call
+				// ceiling; 30 and 90 days both measured as full cap hits. An
+				// operator override is legitimate, so only the default is pinned.
+				const override = process.env.GONG_DEFAULT_SEARCH_DAYS;
+				if (override === undefined || override === '') {
+					expect(DEFAULT_SEARCH_WINDOW_DAYS).toBe(7);
+				} else {
+					expect(DEFAULT_SEARCH_WINDOW_DAYS).toBeGreaterThanOrEqual(1);
+					expect(DEFAULT_SEARCH_WINDOW_DAYS).toBeLessThanOrEqual(3650);
+				}
 			});
 		});
 

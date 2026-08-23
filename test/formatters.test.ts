@@ -171,15 +171,19 @@ describe('formatCallDetailsResponse', () => {
 			calls: [{ metaData: { id: '123', title: 'Sales Call' } }],
 		};
 
+		const window7 = { days: 7, fromDateTime: '2026-08-17T00:00:00.000Z' };
 		const windowed = formatCallDetailsResponse(
 			response,
 			undefined,
 			undefined,
 			false,
-			7,
+			window7,
 		);
-		expect(windowed).toContain('last 7 days');
+		expect(windowed).toContain('7-day window from 2026-08-17');
 		expect(windowed).toContain('fromDateTime');
+		// "No start date", not "no date range": a caller may have passed only an
+		// end date, and the window then sits before that date rather than today.
+		expect(windowed).toContain('No start date was given');
 		// A complete answer for the window carries no truncation caveat.
 		expect(windowed).not.toContain('Partial results');
 
@@ -189,17 +193,19 @@ describe('formatCallDetailsResponse', () => {
 			undefined,
 			undefined,
 			true,
-			7,
+			window7,
 		);
-		expect(both).toContain('last 7 days');
+		expect(both).toContain('7-day window');
 		expect(both).toContain('Partial results');
 		// Says what was searched before saying it was cut short.
-		expect(both.indexOf('last 7 days')).toBeLessThan(
+		expect(both.indexOf('7-day window')).toBeLessThan(
 			both.indexOf('Partial results'),
 		);
 
-		// Silent when the caller gave a range of its own.
-		expect(formatCallDetailsResponse(response)).not.toContain('No date range');
+		// Silent when the caller gave a start date of its own.
+		expect(formatCallDetailsResponse(response)).not.toContain(
+			'No start date was given',
+		);
 	});
 
 	it('formats calls as markdown table from CallDetailsResponse', () => {
